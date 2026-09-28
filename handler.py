@@ -88,13 +88,14 @@ def split_text(text):
     return parts
 
 
-def gen_part(p, kw, seed, cps, ratios, tries):
+def gen_part(p, kw, seed, cps, ratios, tries, style=""):
     exp = max(0.5, count_chars(p) / cps) if cps else None
     base = float(np.median(ratios)) if len(ratios) >= 3 else 1.0
+    text_in = f"({style}){p}" if style else p
     best, best_score, best_ratio, retried = None, None, None, 0
     for attempt in range(tries):
         set_seed(seed + attempt * 7919)
-        w = trim(np.asarray(model.generate(text=p, **kw), dtype=np.float32))
+        w = trim(np.asarray(model.generate(text=text_in, **kw), dtype=np.float32))
         if exp is None:
             return w, 0
         ratio = (len(w) / SR) / exp
@@ -144,6 +145,7 @@ def handler(job):
     fmt = inp.get("format", "mp3")
     tries = max(1, min(5, int(inp.get("tries", 3))))
     seed = int(inp.get("seed", ref_seed))
+    style = re.sub(r"[()]", "", (inp.get("style") or "")).strip()[:200]
 
     parts = split_text(text)
     if not parts:
@@ -167,13 +169,13 @@ def handler(job):
     waves, pauses, ratios, retried = [], [], [], 0
     for i, (p, pause) in enumerate(parts):
         try:
-            w, r = gen_part(p, kw, seed, cps, ratios, tries)
+            w, r = gen_part(p, kw, seed, cps, ratios, tries, style)
         except Exception as e:
             if "prompt_wav_path" in kw:
                 print(f"hifi failed, fallback to ref-only: {e}", flush=True)
                 kw.pop("prompt_wav_path", None)
                 kw.pop("prompt_text", None)
-                w, r = gen_part(p, kw, seed, cps, ratios, tries)
+                w, r = gen_part(p, kw, seed, cps, ratios, tries, style)
             else:
                 raise
         retried += r
@@ -204,6 +206,7 @@ def handler(job):
         "retried": retried,
         "mode": "hifi" if "prompt_wav_path" in kw else "ref",
         "seed": seed,
+        "style": style,
     }
 
 
