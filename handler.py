@@ -6,13 +6,18 @@ import runpod
 from voxcpm import VoxCPM
 
 print("loading model...", flush=True)
-model = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
+model = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)  # denoiser off = no muffled prompt enhancement
 SR = model.tts_model.sample_rate
-print("MODEL READY", flush=True)
+print(f"MODEL READY (sample_rate={SR})", flush=True)
 
 REF_DIR = "/tmp/refs"
 os.makedirs(REF_DIR, exist_ok=True)
-CLEAN_AF = "highpass=f=70,lowpass=f=11000,afftdn=nf=-25"
+REF_SR = 48000  # keep reference detail; VoxCPM resamples internally as needed
+CLEAN_AF = "highpass=f=70,afftdn=nf=-25"  # removed lowpass=11000 (it cut clarity)
+
+# natural breathing pauses (seconds) - can be overridden per request
+PAUSE_SENT_MIN, PAUSE_SENT_MAX = 0.30, 0.45
+PAUSE_COMMA_MIN, PAUSE_COMMA_MAX = 0.18, 0.26
 
 
 def ffmpeg(args, data=None):
@@ -22,19 +27,19 @@ def ffmpeg(args, data=None):
 
 def get_ref(b64, clean=True):
     raw = base64.b64decode(b64)
-    key = hashlib.sha1(raw).hexdigest()[:16] + ("c" if clean else "r")
+    key = hashlib.sha1(raw).hexdigest()[:16] + ("c" if clean else "r") + str(REF_SR)
     path = f"{REF_DIR}/{key}.wav"
     if not os.path.exists(path):
         src = f"{REF_DIR}/{key}.in"
         with open(src, "wb") as f:
             f.write(raw)
-        args = ["-i", src, "-ac", "1", "-ar", "24000"]
+        args = ["-i", src, "-ac", "1", "-ar", str(REF_SR)]
         if clean:
             args += ["-af", CLEAN_AF]
         try:
-            ffmpeg(args + [path])
+            ffmpeg(args + ["-c:a", "pcm_s16le", path])
         except Exception:
-            ffmpeg(["-i", src, "-ac", "1", "-ar", "24000", path])
+            ffmpeg(["-i", src, "-ac", "1", "-ar", str(REF_SR), "-c:a", "pcm_s16le", path])
         os.remove(src)
     return path, int(hashlib.sha1(raw).hexdigest()[:8], 16)
 
@@ -52,13 +57,21 @@ def count_chars(t):
     return len(re.sub(r"[\s။၊,.!?]", "", t or ""))
 
 
-def trim(w, thr=0.01, pad=0.06):
+def trim(w, thr=0.01, pad=0.10):
+    # pad 0.06 -> 0.10 so soft word endings / breaths are not clipped
     idx = np.where(np.abs(w) > thr)[0]
     if len(idx) == 0:
         return w
     s = max(0, idx[0] - int(SR * pad))
     e = min(len(w), idx[-1] + int(SR * pad))
-    return w[s:e]
+    w = w[s:e].copy()
+    # 10ms fade in/out to avoid clicks at joins
+    f = min(len(w) // 4, int(SR * 0.01))
+    if f > 0:
+        ramp = np.linspace(0.0, 1.0, f, dtype=np.float32)
+        w[:f] *= ramp
+        w[-f:] *= ramp[::-1]
+    return w
 
 
 def active_rms(w, thr=0.01):
@@ -66,25 +79,32 @@ def active_rms(w, thr=0.01):
     return float(np.sqrt(np.mean(a ** 2))) if len(a) else 0.0
 
 
+def end_mark(s):
+    return s if s[-1:] in ".?!" else s + "။"
+
+
 def split_text(text):
+    # Sentence split on Burmese ။ and English . ? ! ; long sentences further split on ၊ and ,
+    # Returns (part, kind) where kind is "sent" or "comma" (pause after the part)
+    text = re.sub(r"([.?!])(\s+|$)", r"\1။", text)
     parts = []
     for s in re.split(r"[။\n]+", text):
         s = s.strip()
         if not s:
             continue
         if len(s) <= 250:
-            parts.append((s + "။", 0.26))
+            parts.append((end_mark(s), "sent"))
             continue
-        pieces = [x.strip() for x in s.split("၊") if x.strip()]
+        pieces = [x.strip() for x in re.split(r"[၊,]", s) if x.strip()]
         chunk = ""
         for piece in pieces:
             if chunk and len(chunk) + len(piece) > 250:
-                parts.append((chunk + "။", 0.16))
+                parts.append((end_mark(chunk), "comma"))
                 chunk = piece
             else:
                 chunk = f"{chunk}၊ {piece}" if chunk else piece
         if chunk:
-            parts.append((chunk + "။", 0.26))
+            parts.append((end_mark(chunk), "sent"))
     return parts
 
 
@@ -139,13 +159,15 @@ def handler(job):
     except Exception as e:
         return {"error": f"ref audio convert failed: {e}"}
     reftx = (inp.get("prompt_text") or "").strip()
-    mode = inp.get("clone_mode", "ref")
+    mode = inp.get("clone_mode", "hifi")  # default hifi: uses prompt_text for closer voice match
     cfg = float(inp.get("cfg_value", 2.0))
     steps = int(inp.get("inference_timesteps", 10))
-    fmt = inp.get("format", "mp3")
+    fmt = inp.get("format", "wav")
     tries = max(1, min(5, int(inp.get("tries", 3))))
     seed = int(inp.get("seed", ref_seed))
     style = re.sub(r"[()]", "", (inp.get("style") or "")).strip()[:200]
+    ps_min = float(inp.get("pause_min", PAUSE_SENT_MIN))
+    ps_max = float(inp.get("pause_max", PAUSE_SENT_MAX))
 
     parts = split_text(text)
     if not parts:
@@ -166,8 +188,9 @@ def handler(job):
         except Exception:
             cps = None
 
+    rng = random.Random(seed)
     waves, pauses, ratios, retried = [], [], [], 0
-    for i, (p, pause) in enumerate(parts):
+    for i, (p, kind) in enumerate(parts):
         try:
             w, r = gen_part(p, kw, seed, cps, ratios, tries, style)
         except Exception as e:
@@ -180,7 +203,10 @@ def handler(job):
                 raise
         retried += r
         waves.append(w)
-        pauses.append(pause)
+        if kind == "sent":
+            pauses.append(rng.uniform(ps_min, ps_max))
+        else:
+            pauses.append(rng.uniform(PAUSE_COMMA_MIN, PAUSE_COMMA_MAX))
         runpod.serverless.progress_update(job, f"{i + 1}/{len(parts)}")
 
     waves = match_loudness(waves)
@@ -192,10 +218,10 @@ def handler(job):
     wav = np.concatenate(out)
 
     buf = io.BytesIO()
-    sf.write(buf, wav, SR, format="WAV")
+    sf.write(buf, wav, SR, format="WAV", subtype="PCM_16")
     data = buf.getvalue()
     if fmt == "mp3":
-        data = ffmpeg(["-f", "wav", "-i", "pipe:0", "-ac", "1", "-b:a", "128k",
+        data = ffmpeg(["-f", "wav", "-i", "pipe:0", "-ac", "1", "-b:a", "192k",
                        "-f", "mp3", "pipe:1"], data)
     return {
         "audio_b64": base64.b64encode(data).decode(),
